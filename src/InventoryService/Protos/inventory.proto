@@ -1,0 +1,291 @@
+syntax = "proto3";
+
+// Shared inventory contract between the Laravel e-commerce application (gRPC
+// client, PHP) and the ASP.NET Core Inventory Service (gRPC server, C#).
+//
+// The package is versioned: breaking changes go into a new "v2" package instead
+// of mutating this one, so both repositories can migrate independently.
+package ecommerce.inventory.v1;
+
+// Namespaces for the two languages that consume this contract. The PHP value
+// matches what protoc would derive from the package name anyway; it is stated
+// explicitly so both teams see the same namespace in the contract itself.
+option csharp_namespace = "ECommerce.Inventory.V1";
+option php_namespace = "Ecommerce\\Inventory\\V1";
+
+// ---------------------------------------------------------------------------
+// Reservation lifecycle
+// ---------------------------------------------------------------------------
+//
+// A reservation_id, supplied by the caller, has exactly three possible states
+// on the server:
+//
+//   UNKNOWN   no record exists for this id yet
+//   ACTIVE    quantities are currently held for this id
+//   RELEASED  the held quantities were returned to stock; terminal and final
+//
+// Transitions:
+//
+//   UNKNOWN  --ReserveStock, stock sufficient--> ACTIVE
+//   ACTIVE   --ReleaseStock-------------------> RELEASED
+//
+// There is no transition out of RELEASED. An id that has been released is
+// spent: replaying ReserveStock with it is rejected with FAILED_PRECONDITION
+// and never re-holds quantities. The record is kept precisely so that this
+// rejection is possible rather than silently creating a second reservation.
+//
+// A request that fails for insufficient stock creates NO record, so the id
+// stays UNKNOWN. Idempotency therefore covers successful reservations only:
+// see ReserveStock for the full rule.
+//
+// Every reply describes the state at the moment the call was processed, and
+// nothing more. Calls bearing the same reservation_id are serialized, so at
+// most one of them can create the reservation however many arrive together -
+// but a single reply cannot tell the caller whether another of its own calls
+// for that id is still in flight. That distinction drives the reconciliation
+// rule below.
+//
+// ---------------------------------------------------------------------------
+// Caller responsibilities (Laravel)
+// ---------------------------------------------------------------------------
+//
+// 1. Generate one reservation_id per order-creation attempt, before the first
+//    call, and reuse it verbatim for every retry, for reconciliation, and for
+//    the eventual release of that attempt.
+// 2. Call ReleaseStock whenever reserved quantities must go back to stock:
+//    both when the order fails to persist after a successful reservation, and
+//    when an eligible saved order is later cancelled. Releasing is the caller's
+//    job; the service never releases on its own.
+// 3. Set a deadline on every call, and read a timeout or connection error as an
+//    UNKNOWN outcome rather than a failure. A deadline stops the caller
+//    waiting; it does not stop the server, so a call the caller gave up on may
+//    still take effect afterwards.
+// 4. Resolve an UNKNOWN ReserveStock outcome before treating compensation for
+//    it as complete, and never have ReserveStock and ReleaseStock for the same
+//    reservation_id outstanding at the same time. Reconcile by repeating
+//    ReserveStock with the same reservation_id and the same items:
+//
+//      RESERVED or ALREADY_RESERVED  the quantities are held exactly once, so
+//                                    ReleaseStock can now undo them
+//      FAILED_PRECONDITION           the id is spent; it was already released
+//                                    and compensation is already complete
+//      INSUFFICIENT_STOCK            no record existed at that moment
+//
+//    Compensating first is what goes wrong: a ReleaseStock that overtakes an
+//    unresolved ReserveStock answers NOT_FOUND, and the reservation it was
+//    meant to undo can then be created behind it - quantities held with no
+//    order behind them. Reconcile first, compensate second.
+// 5. Keep the reservation_id together with its item list until the attempt is
+//    known to be resolved, in storage that outlives the request being served.
+//    Both are what the reconciliation in (4) needs; the id alone will not do,
+//    because replaying ReserveStock with different items is rejected. While
+//    the service is UNAVAILABLE an attempt simply stays UNKNOWN, and
+//    reconciliation has to wait until the service is reachable again.
+//
+// Provisioning inventory rows for new products is deliberately not part of
+// this contract and is a separate integration decision.
+
+// Inventory operations required by the ordering flow.
+//
+// The service is named "Inventory" rather than "InventoryService" on purpose:
+// the C# project root namespace is already "InventoryService", and a generated
+// type with that same name would be ambiguous with the namespace.
+service Inventory {
+  // Returns the quantity of a single product that can still be reserved.
+  // Laravel calls this when rendering product details.
+  //
+  // The answer is a snapshot and may be stale by the time the caller acts on
+  // it; only ReserveStock decides whether quantities can actually be held.
+  //
+  // Errors: NOT_FOUND if the product is unknown to the inventory database,
+  // INVALID_ARGUMENT if product_id is not positive.
+  rpc GetStock (GetStockRequest) returns (GetStockResponse);
+
+  // Reserves the quantities for one complete order, atomically.
+  //
+  // All items of the order travel in a single request. Either every item is
+  // reserved or nothing is: there is no partial reservation.
+  //
+  // Idempotency applies to successful reservations only, by reservation_id:
+  //
+  //   id ACTIVE, same items        -> ALREADY_RESERVED, inventory untouched
+  //   id ACTIVE, different items   -> ALREADY_EXISTS error
+  //   id RELEASED, any items       -> FAILED_PRECONDITION error
+  //   id UNKNOWN, stock sufficient -> RESERVED
+  //   id UNKNOWN, stock short      -> INSUFFICIENT_STOCK, no record created
+  //
+  // The RELEASED check comes first, so a replay of a released id is always
+  // FAILED_PRECONDITION and never ALREADY_EXISTS.
+  //
+  // Repeating this call with an unchanged reservation_id and unchanged items is
+  // therefore always safe, and is how the caller resolves an UNKNOWN outcome
+  // after a timeout: whichever of RESERVED or ALREADY_RESERVED comes back, the
+  // quantities are held exactly once and the attempt is no longer UNKNOWN. What
+  // a reply cannot do is prove that no other call for the same id is still in
+  // flight - see caller responsibility (4).
+  //
+  // Because an insufficient-stock request stores nothing, the service does not
+  // remember it and makes no promise to answer the same way later. Repeating
+  // such a request is a fresh evaluation against current stock, so it may
+  // succeed if quantities have since been restocked or released.
+  //
+  // Errors: FAILED_PRECONDITION if reservation_id was already released,
+  // ALREADY_EXISTS if it is active with different items, NOT_FOUND if any
+  // product is unknown, INVALID_ARGUMENT for malformed requests. Insufficient
+  // stock is NOT an error - see ReserveStockResponse.
+  rpc ReserveStock (ReserveStockRequest) returns (ReserveStockResponse);
+
+  // Releases an active reservation, returning its quantities to available
+  // stock. Laravel calls this when an order failed to persist after a
+  // successful reservation, and when an eligible saved order is cancelled.
+  //
+  // The caller identifies the reservation only; it never supplies quantities,
+  // so it cannot release more than was reserved. The call is idempotent:
+  // the first call moves the reservation to RELEASED, and every repeat reports
+  // ALREADY_RELEASED and restores nothing further. Quantities are therefore
+  // restored exactly once per reservation_id, however many times this is
+  // called.
+  //
+  // Errors: NOT_FOUND when no reservation existed for the id as this call was
+  // processed. That is a statement about that moment alone. It does not resolve
+  // an earlier ReserveStock for the same id that may still be in flight, and it
+  // does not prevent that reservation from being created afterwards, so
+  // NOT_FOUND on its own never establishes that an attempt left nothing behind.
+  // It means "nothing to undo" only once no call for that id is outstanding -
+  // reconcile first, as caller responsibility (4) describes. NOT_FOUND also
+  // covers an id whose only prior request failed for insufficient stock, since
+  // that stores no record. INVALID_ARGUMENT if the id is empty.
+  rpc ReleaseStock (ReleaseStockRequest) returns (ReleaseStockResponse);
+}
+
+// ---------------------------------------------------------------------------
+// GetStock
+// ---------------------------------------------------------------------------
+
+message GetStockRequest {
+  // Product primary key as owned by the Laravel application. Must be > 0.
+  int64 product_id = 1;
+}
+
+message GetStockResponse {
+  // Echoes the requested product_id.
+  int64 product_id = 1;
+
+  // Quantity that may still be reserved: physical stock minus the quantities
+  // currently held by active reservations. Never negative.
+  int32 available_quantity = 2;
+}
+
+// ---------------------------------------------------------------------------
+// ReserveStock
+// ---------------------------------------------------------------------------
+
+message ReserveStockRequest {
+  // Idempotency key for this reservation, generated by the caller (Laravel)
+  // before the first attempt and reused verbatim on every retry of the same
+  // order attempt. A UUID is expected. Required and non-empty.
+  //
+  // The id is also the handle used later by ReleaseStock, and it carries the
+  // reservation's state for its whole life - including the terminal RELEASED
+  // state, which permanently blocks any further ReserveStock with this id.
+  // See "Reservation lifecycle" above.
+  string reservation_id = 1;
+
+  // The order lines to reserve. Must contain at least one item, and a product
+  // must not appear twice.
+  //
+  // The caller needs to keep this list for as long as the attempt's outcome is
+  // unresolved: reconciling the attempt means sending it again unchanged.
+  repeated ReserveStockItem items = 2;
+}
+
+// One order line to reserve.
+message ReserveStockItem {
+  // Product primary key as owned by the Laravel application. Must be > 0.
+  int64 product_id = 1;
+
+  // Quantity requested for this product. Must be > 0.
+  int32 quantity = 2;
+}
+
+message ReserveStockResponse {
+  // Outcome of the reservation. RESERVED and ALREADY_RESERVED both mean the
+  // quantities are held; INSUFFICIENT_STOCK means nothing was held at all.
+  ReserveStockStatus status = 1;
+
+  // Echoes the reservation_id, so Laravel can correlate a response with the
+  // order attempt it retried.
+  string reservation_id = 2;
+
+  // Populated only when status is INSUFFICIENT_STOCK: the products that could
+  // not satisfy the request, with the quantity that was available. Lets Laravel
+  // tell the customer exactly which lines failed. Empty otherwise.
+  //
+  // These quantities describe stock as the request was evaluated and nothing
+  // more. They are not retained, and a later request for the same items may
+  // well be answered differently.
+  repeated InsufficientStockItem insufficient_items = 3;
+}
+
+// A product that blocked the reservation.
+message InsufficientStockItem {
+  int64 product_id = 1;
+
+  // Quantity the request asked for.
+  int32 requested_quantity = 2;
+
+  // Quantity that was actually available when the reservation was evaluated.
+  int32 available_quantity = 3;
+}
+
+enum ReserveStockStatus {
+  // Never sent by the server; guards against an unset field being read as a
+  // meaningful outcome.
+  RESERVE_STOCK_STATUS_UNSPECIFIED = 0;
+
+  // The quantities were reserved by this call. The reservation is now ACTIVE.
+  RESERVE_STOCK_STATUS_RESERVED = 1;
+
+  // This reservation_id was already ACTIVE with these same items, from an
+  // earlier call. The quantities are held exactly once and this call changed
+  // nothing. Reconciling an UNKNOWN outcome arrives here when the earlier
+  // attempt had taken effect, and at RESERVED when it had not; both leave the
+  // attempt resolved and the quantities held once.
+  RESERVE_STOCK_STATUS_ALREADY_RESERVED = 2;
+
+  // Nothing was reserved: at least one product had insufficient quantity. See
+  // insufficient_items. No reservation record was created, so the
+  // reservation_id remains unused and this outcome is not remembered.
+  RESERVE_STOCK_STATUS_INSUFFICIENT_STOCK = 3;
+}
+
+// ---------------------------------------------------------------------------
+// ReleaseStock
+// ---------------------------------------------------------------------------
+
+message ReleaseStockRequest {
+  // The reservation_id of a previously successful ReserveStock call.
+  // Required and non-empty.
+  string reservation_id = 1;
+}
+
+message ReleaseStockResponse {
+  ReleaseStockStatus status = 1;
+
+  // Echoes the reservation_id.
+  string reservation_id = 2;
+}
+
+enum ReleaseStockStatus {
+  // Never sent by the server.
+  RELEASE_STOCK_STATUS_UNSPECIFIED = 0;
+
+  // The reservation was ACTIVE and its quantities are now available again.
+  // It is now RELEASED, and that state is terminal.
+  RELEASE_STOCK_STATUS_RELEASED = 1;
+
+  // The reservation was already RELEASED; this call restored nothing. A repeat
+  // of ReleaseStock arrives here, and so does a release whose own outcome was
+  // UNKNOWN and is being resolved.
+  RELEASE_STOCK_STATUS_ALREADY_RELEASED = 2;
+}
