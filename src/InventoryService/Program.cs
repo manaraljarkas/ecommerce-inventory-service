@@ -8,7 +8,7 @@ builder.Services.AddGrpc();
 var app = builder.Build();
 
 // Configure the HTTP request pipeline.
-app.MapGrpcService<GreeterService>();
-app.MapGet("/", () => "Communication with gRPC endpoints must be made through a gRPC client. To learn how to create a client, visit: https://go.microsoft.com/fwlink/?linkid=2086909");
+app.MapGrpcService<InventoryGrpcService>();
+app.MapGet("/", () => "Inventory gRPC service. Communication with gRPC endpoints must be made through a gRPC client using the ecommerce.inventory.v1.Inventory contract.");
 
 app.Run();
