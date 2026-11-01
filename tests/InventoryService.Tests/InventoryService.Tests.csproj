@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <!-- xunit.v3 runs on Microsoft.Testing.Platform: the test project is its own executable,
+         so no VSTest runner packages are needed and "dotnet test" still works. -->
+    <OutputType>Exe</OutputType>
+    <!-- Same id as the service, so tests read the same ConnectionStrings:InventoryDb secret
+         and never need a connection string of their own checked in. -->
+    <UserSecretsId>2011e0be-6e33-477f-99da-5ecf9b13585e</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\InventoryService\InventoryService.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The generated client stub and message types come from the referenced service project,
+         which compiles the contract with GrpcServices="Both". Generating them again here would
+         put the same types in two assemblies. -->
+    <PackageReference Include="xunit.v3" Version="4.0.2" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.14" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.UserSecrets" Version="10.0.14" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.64.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The seed-binding tests bind the file the service actually ships, so it is copied in
+         rather than duplicated here. Renamed on the way, so it is never mistaken for
+         configuration of the test host itself. -->
+    <Content Include="..\..\src\InventoryService\appsettings.Development.json"
+             Link="service.appsettings.Development.json"
+             CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
