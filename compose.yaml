@@ -1,0 +1,125 @@
+# Inventory gRPC service + SQL Server, entirely in Docker.
+#   docker compose up -d --build
+# Startup order (enforced by depends_on conditions, not by sleeps):
+#   sqlserver (healthy) -> migrator (applies EF Core migrations, exits 0)
+#                       -> db-grants (creates the API's low-privilege login, exits 0)
+#                       -> inventory-api
+# Configuration comes from ".env" (see .env.example). Nothing secret is stored here.
+
+name: ecommerce-inventory
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: ecommerce-inventory-sqlserver
+    restart: unless-stopped
+    # The image's own entrypoint is a bash wrapper that runs sqlservr in the background and
+    # traps no signals; as PID 1 it ignores SIGTERM, so "docker stop" always ended in SIGKILL
+    # (exit 137) and a crash recovery on the next start. Exec-ing sqlservr makes SQL Server
+    # PID 1, so it receives SIGTERM and shuts down cleanly (measured: 1s, exit 0).
+    entrypoint: ["/bin/sh", "-c", "exec /opt/mssql/bin/sqlservr"]
+    stop_grace_period: 30s
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in .env (copy .env.example)}
+      MSSQL_MEMORY_LIMIT_MB: "2048"
+      # Read by sqlcmd, so the health check needs no password on its command line.
+      SQLCMDPASSWORD: ${MSSQL_SA_PASSWORD}
+    volumes:
+      - sqldata:/var/opt/mssql
+    networks:
+      - inventory-net
+    # No "ports:" on purpose: the host's own SQL Server owns 1433, and the database is
+    # only meant to be reachable from inside the Docker network.
+    healthcheck:
+      # A real authenticated query, not a process or TCP check.
+      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-C", "-b", "-S", "localhost", "-U", "sa",
+             "-Q", "IF DATABASEPROPERTYEX(N'tempdb', N'Status') <> N'ONLINE' THROW 50000, N'not ready', 1;"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  migrator:
+    build:
+      context: .
+      target: migrator
+    image: ecommerce-inventory-migrator:local
+    container_name: ecommerce-inventory-migrator
+    restart: "no"
+    environment:
+      # Database name is fixed here on purpose; "sqlserver" resolves only on this stack's network.
+      ConnectionStrings__InventoryDb: 'Server=sqlserver,1433;Database=ECommerceInventoryDb;User Id=sa;Password="${MSSQL_SA_PASSWORD}";Encrypt=True;TrustServerCertificate=True'
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    networks:
+      - inventory-net
+
+  db-grants:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: ecommerce-inventory-db-grants
+    restart: "no"
+    entrypoint: ["/opt/mssql-tools18/bin/sqlcmd", "-C", "-b", "-S", "sqlserver", "-U", "sa",
+                 "-i", "/scripts/grant-app-access.sql"]
+    environment:
+      SQLCMDPASSWORD: ${MSSQL_SA_PASSWORD}
+      INVENTORY_APP_PASSWORD: ${INVENTORY_APP_PASSWORD:?Set INVENTORY_APP_PASSWORD in .env}
+    volumes:
+      - ./docker/sql/grant-app-access.sql:/scripts/grant-app-access.sql:ro
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    networks:
+      - inventory-net
+
+  inventory-api:
+    build:
+      context: .
+      target: final
+    image: ecommerce-inventory-api:local
+    container_name: ecommerce-inventory-api
+    restart: unless-stopped
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Production}
+      ASPNETCORE_HTTP_PORTS: "8080"
+      # gRPC needs HTTP/2; without TLS that means prior-knowledge h2c. Stated here as
+      # well as in appsettings.json so it is visible at the point of deployment.
+      Kestrel__EndpointDefaults__Protocols: Http2
+      # The API connects as the low-privilege login, never as sa.
+      ConnectionStrings__InventoryDb: 'Server=sqlserver,1433;Database=ECommerceInventoryDb;User Id=inventory_app;Password="${INVENTORY_APP_PASSWORD}";Encrypt=True;TrustServerCertificate=True'
+      # Development seeding: only runs when ASPNETCORE_ENVIRONMENT=Development AND enabled.
+      # Demo ids 900001-900003 are NOT Laravel product ids. Insert-only, never updates.
+      InventorySeed__Enabled: ${INVENTORY_SEED_ENABLED:-false}
+      InventorySeed__Items__0__ProductId: "900001"
+      InventorySeed__Items__0__QuantityOnHand: "25"
+      InventorySeed__Items__1__ProductId: "900002"
+      InventorySeed__Items__1__QuantityOnHand: "10"
+      InventorySeed__Items__2__ProductId: "900003"
+      InventorySeed__Items__2__QuantityOnHand: "1"
+    depends_on:
+      db-grants:
+        condition: service_completed_successfully
+    ports:
+      # Loopback only: reachable from Windows as localhost:5275, not from the LAN.
+      - "127.0.0.1:${INVENTORY_HOST_PORT:-5275}:8080"
+    networks:
+      - inventory-net
+    healthcheck:
+      # Honest scope: proves the gRPC listener accepts connections. It does not call the
+      # database, and the image has no gRPC client, so nothing deeper is claimed.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+networks:
+  inventory-net:
+    # Fixed name so another Compose project can join it as an external network.
+    name: ecommerce-inventory-net
+
+volumes:
+  sqldata:
+    name: ecommerce-inventory-sqldata
