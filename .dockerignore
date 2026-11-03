@@ -1,0 +1,30 @@
+# Version control and IDE
+.git
+.gitignore
+.gitattributes
+.vs
+.vscode
+.idea
+*.user
+*.suo
+
+# Build output and test results
+**/bin
+**/obj
+**/TestResults
+**/test-results
+
+# Local environment, secrets and logs - never part of an image
+.env
+.env.*
+!.env.example
+**/secrets.json
+**/*.pfx
+**/*.log
+
+# Not needed to build the service
+tests
+docker
+compose*.yaml
+Dockerfile
+.dockerignore
