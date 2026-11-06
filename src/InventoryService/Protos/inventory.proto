@@ -82,8 +82,19 @@ option php_namespace = "Ecommerce\\Inventory\\V1";
 //    the service is UNAVAILABLE an attempt simply stays UNKNOWN, and
 //    reconciliation has to wait until the service is reachable again.
 //
-// Provisioning inventory rows for new products is deliberately not part of
-// this contract and is a separate integration decision.
+// Provisioning
+//
+// A product gets its inventory record, and so its first stock, through
+// CreateInventoryItem, which the caller invokes once when a product is created.
+// Everything else here assumes that record exists: GetStock and ReserveStock
+// answer NOT_FOUND for a product that was never provisioned. CreateInventoryItem
+// is the only operation that creates a record, and it never changes one that
+// exists. Restocking is deliberately not part of this contract.
+//
+// Unlike the other operations it is guarded by a shared secret, sent as the
+// "x-provisioning-token" call metadata, because creating stock is something only
+// the application that owns the product catalogue may do. A server with no
+// secret configured refuses the call instead of accepting it unauthenticated.
 
 // Inventory operations required by the ordering flow.
 //
@@ -156,6 +167,35 @@ service Inventory {
   // covers an id whose only prior request failed for insufficient stock, since
   // that stores no record. INVALID_ARGUMENT if the id is empty.
   rpc ReleaseStock (ReleaseStockRequest) returns (ReleaseStockResponse);
+
+  // Creates the inventory record of a product that has none, holding
+  // initial_quantity units and no reservations. The caller (Laravel) invokes it
+  // once, when an administrator creates a product, with the product's real id.
+  //
+  // The service records the initial_quantity it was provisioned with, permanently
+  // and separately from the live stock. A repeat is judged against that record,
+  // never against current stock, which reservations and restocking keep changing:
+  //
+  //   no record for product_id                      -> CREATED
+  //   provisioned by this RPC, same initial_quantity -> ALREADY_CREATED, nothing changed
+  //   provisioned by this RPC, other initial_quantity -> ALREADY_EXISTS error
+  //   record exists but was not provisioned by this RPC -> ALREADY_EXISTS error
+  //
+  // The last case covers a record that was seeded or entered by hand: it is not
+  // evidence that this request was ever applied, so it is reported as a conflict
+  // rather than as success, and its quantities are left exactly as they are.
+  //
+  // Repeating a call with an unchanged product_id and initial_quantity is
+  // therefore always safe and never adds stock twice. It is how the caller
+  // resolves an UNKNOWN outcome after a timeout: CREATED or ALREADY_CREATED both
+  // mean the record exists once, with the quantity that was asked for.
+  //
+  // Authentication: the call must carry the "x-provisioning-token" metadata.
+  //
+  // Errors: INVALID_ARGUMENT if product_id is not positive or initial_quantity is
+  // negative, ALREADY_EXISTS as described above, UNAUTHENTICATED if the token is
+  // missing or wrong, FAILED_PRECONDITION if the server has provisioning disabled.
+  rpc CreateInventoryItem (CreateInventoryItemRequest) returns (CreateInventoryItemResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -288,4 +328,37 @@ enum ReleaseStockStatus {
   // of ReleaseStock arrives here, and so does a release whose own outcome was
   // UNKNOWN and is being resolved.
   RELEASE_STOCK_STATUS_ALREADY_RELEASED = 2;
+}
+
+// ---------------------------------------------------------------------------
+// CreateInventoryItem
+// ---------------------------------------------------------------------------
+
+message CreateInventoryItemRequest {
+  // Product primary key as owned by the Laravel application: the id the product
+  // actually has, never a guess. Must be > 0.
+  int64 product_id = 1;
+
+  // Units in stock when the product is created. Must be >= 0; zero is allowed
+  // and makes a product that exists but cannot be reserved yet.
+  int32 initial_quantity = 2;
+}
+
+message CreateInventoryItemResponse {
+  CreateInventoryItemStatus status = 1;
+
+  // Echoes the requested product_id.
+  int64 product_id = 2;
+}
+
+enum CreateInventoryItemStatus {
+  // Never sent by the server.
+  CREATE_INVENTORY_ITEM_STATUS_UNSPECIFIED = 0;
+
+  // The record did not exist and was created by this call.
+  CREATE_INVENTORY_ITEM_STATUS_CREATED = 1;
+
+  // This product was already provisioned with this same initial_quantity by an
+  // earlier call. Nothing was changed and no stock was added.
+  CREATE_INVENTORY_ITEM_STATUS_ALREADY_CREATED = 2;
 }

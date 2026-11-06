@@ -102,7 +102,39 @@ public sealed class SqlServerDatabaseFixture : IAsyncLifetime
         await using var db = CreateContext();
         await db.Database.ExecuteSqlRawAsync("DELETE FROM ReservationItems");
         await db.Database.ExecuteSqlRawAsync("DELETE FROM Reservations");
+        // References InventoryItems, so it has to go first.
+        await db.Database.ExecuteSqlRawAsync("DELETE FROM InventoryProvisionings");
         await db.Database.ExecuteSqlRawAsync("DELETE FROM InventoryItems");
+    }
+
+    /// The initial quantity recorded when the product was provisioned, or null if it never was.
+    public async Task<int?> ReadInitialQuantityAsync(long productId)
+    {
+        await using var db = CreateContext();
+        return await db.InventoryProvisionings.AsNoTracking()
+            .Where(p => p.ProductId == productId)
+            .Select(p => (int?)p.InitialQuantity)
+            .FirstOrDefaultAsync();
+    }
+
+    public async Task<int> CountInventoryRowsAsync(long productId)
+    {
+        await using var db = CreateContext();
+        return await db.InventoryItems.AsNoTracking().CountAsync(i => i.ProductId == productId);
+    }
+
+    public async Task<int> CountProvisioningRowsAsync(long productId)
+    {
+        await using var db = CreateContext();
+        return await db.InventoryProvisionings.AsNoTracking().CountAsync(p => p.ProductId == productId);
+    }
+
+    /// Changes the live stock behind the service's back, the way a restock would.
+    public async Task SetQuantityOnHandAsync(long productId, int onHand)
+    {
+        await using var db = CreateContext();
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"UPDATE InventoryItems SET QuantityOnHand = {onHand} WHERE ProductId = {productId}");
     }
 
     public async Task SeedProductAsync(long productId, int onHand, int reserved = 0)

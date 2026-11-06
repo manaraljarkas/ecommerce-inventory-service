@@ -290,6 +290,85 @@ public class InventoryOperations(InventoryDbContext db, ILogger<InventoryOperati
         return new ReleaseStockResult(ReleaseStockOutcome.Released);
     }
 
+    // -------------------------------------------------------- CreateInventoryItem
+
+    /// Creates the inventory row of a product, and the permanent record of the quantity it was
+    /// created with, in one transaction. Nothing existing is ever modified: a product that already
+    /// has a row only ever produces AlreadyCreated or Conflict.
+    ///
+    /// The Primary Keys are the guarantee. Two concurrent calls for one product both try to insert
+    /// the same key; the second waits for the first to settle and then fails with a duplicate key,
+    /// so exactly one row can exist however the calls interleave.
+    public async Task<CreateInventoryItemResult> CreateInventoryItemAsync(
+        long productId,
+        int initialQuantity,
+        CancellationToken ct)
+    {
+        if (productId <= 0)
+        {
+            return new CreateInventoryItemResult(
+                CreateInventoryItemOutcome.InvalidArgument, "product_id must be greater than zero.");
+        }
+
+        if (initialQuantity < 0)
+        {
+            return new CreateInventoryItemResult(
+                CreateInventoryItemOutcome.InvalidArgument, "initial_quantity must not be negative.");
+        }
+
+        await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+
+        try
+        {
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $@"INSERT INTO InventoryItems (ProductId, QuantityOnHand, QuantityReserved)
+                   VALUES ({productId}, {initialQuantity}, 0)",
+                ct);
+
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $@"INSERT INTO InventoryProvisionings (ProductId, InitialQuantity, CreatedAtUtc)
+                   VALUES ({productId}, {initialQuantity}, {DateTime.UtcNow})",
+                ct);
+
+            await transaction.CommitAsync(ct);
+        }
+        catch (Microsoft.Data.SqlClient.SqlException ex)
+            when (ex.Number is SqlDuplicateKey or SqlUniqueIndexViolation)
+        {
+            // A row for this product exists, committed by someone else: the insert only fails once
+            // that transaction has settled. Nothing of ours was written.
+            await transaction.RollbackAsync(ct);
+
+            return await ResolveExistingProvisioningAsync(productId, initialQuantity, ct);
+        }
+
+        logger.LogInformation(
+            "Provisioned inventory for product {ProductId} with {InitialQuantity} unit(s)",
+            productId, initialQuantity);
+
+        return new CreateInventoryItemResult(CreateInventoryItemOutcome.Created);
+    }
+
+    /// Decides what an existing row means for a provisioning request. It is judged against the
+    /// quantity recorded when the product was provisioned, never against the current stock, which
+    /// reservations and restocks keep moving. No provisioning record at all means the row came from
+    /// somewhere else (a seed, or by hand) and is a conflict, not a replay.
+    private async Task<CreateInventoryItemResult> ResolveExistingProvisioningAsync(
+        long productId,
+        int initialQuantity,
+        CancellationToken ct)
+    {
+        var recorded = await db.InventoryProvisionings
+            .AsNoTracking()
+            .Where(p => p.ProductId == productId)
+            .Select(p => (int?)p.InitialQuantity)
+            .FirstOrDefaultAsync(ct);
+
+        return new CreateInventoryItemResult(recorded == initialQuantity
+            ? CreateInventoryItemOutcome.AlreadyCreated
+            : CreateInventoryItemOutcome.Conflict);
+    }
+
     // ---------------------------------------------------------------- helpers
 
     /// Reads one inventory row under an update lock held to the end of the transaction.
