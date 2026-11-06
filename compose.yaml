@@ -98,6 +98,9 @@ services:
       InventorySeed__Items__1__QuantityOnHand: "10"
       InventorySeed__Items__2__ProductId: "900003"
       InventorySeed__Items__2__QuantityOnHand: "1"
+      # Shared secret for CreateInventoryItem (the "x-provisioning-token" call metadata). Left
+      # empty, that RPC is refused, so nothing can create stock until a token is set in .env.
+      Provisioning__Token: ${INVENTORY_PROVISIONING_TOKEN:-}
     depends_on:
       db-grants:
         condition: service_completed_successfully

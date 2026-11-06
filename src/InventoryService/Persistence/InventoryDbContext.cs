@@ -13,6 +13,8 @@ public class InventoryDbContext(DbContextOptions<InventoryDbContext> options) : 
 {
     public DbSet<InventoryItem> InventoryItems => Set<InventoryItem>();
 
+    public DbSet<InventoryProvisioning> InventoryProvisionings => Set<InventoryProvisioning>();
+
     public DbSet<Reservation> Reservations => Set<Reservation>();
 
     public DbSet<ReservationItem> ReservationItems => Set<ReservationItem>();

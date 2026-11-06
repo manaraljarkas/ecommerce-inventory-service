@@ -81,3 +81,24 @@ public sealed record ReleaseStockResult(
 /// below the gRPC layer depends on the generated protobuf types.
 
 public readonly record struct RequestedItem(long ProductId, int Quantity);
+
+
+/// Outcomes of InventoryOperations.CreateInventoryItemAsync
+public enum CreateInventoryItemOutcome
+{
+    /// The inventory row did not exist and was created by this call.
+    Created,
+
+    /// The product was already provisioned with this same initial quantity; nothing changed.
+    AlreadyCreated,
+
+    /// An inventory row exists that this request does not account for: it was provisioned with a
+    /// different initial quantity, or was never provisioned through this operation at all.
+    Conflict,
+
+    InvalidArgument
+}
+
+public sealed record CreateInventoryItemResult(
+    CreateInventoryItemOutcome Outcome,
+    string? ValidationError = null);

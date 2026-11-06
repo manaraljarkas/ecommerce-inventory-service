@@ -33,6 +33,10 @@ builder.Services.AddScoped<InventoryOperations>();
 builder.Services.Configure<InventorySeedOptions>(
     builder.Configuration.GetSection(InventorySeedOptions.SectionName));
 
+// The shared secret for CreateInventoryItem (Provisioning__Token). Left empty, that RPC is refused.
+builder.Services.Configure<ProvisioningOptions>(
+    builder.Configuration.GetSection(ProvisioningOptions.SectionName));
+
 var app = builder.Build();
 
 // Development-only stock seeding, off unless InventorySeed:Enabled is true. It inserts rows for

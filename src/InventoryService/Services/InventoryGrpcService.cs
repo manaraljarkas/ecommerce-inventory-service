@@ -1,6 +1,9 @@
+using System.Security.Cryptography;
+using System.Text;
 using ECommerce.Inventory.V1;
 using Grpc.Core;
 using InventoryService.Application;
+using Microsoft.Extensions.Options;
 
 namespace InventoryService.Services;
 
@@ -18,8 +21,11 @@ namespace InventoryService.Services;
 
 public class InventoryGrpcService(
     InventoryOperations operations,
+    IOptions<ProvisioningOptions> provisioning,
     ILogger<InventoryGrpcService> logger) : Inventory.InventoryBase
 {
+    private const string ProvisioningTokenHeader = "x-provisioning-token";
+
     public override async Task<GetStockResponse> GetStock(
         GetStockRequest request, ServerCallContext context)
     {
@@ -135,6 +141,64 @@ public class InventoryGrpcService(
 
             _ => throw UnexpectedOutcome(result.Outcome)
         };
+    }
+
+    public override async Task<CreateInventoryItemResponse> CreateInventoryItem(
+        CreateInventoryItemRequest request, ServerCallContext context)
+    {
+        // Authentication comes first, so an unauthorised caller learns nothing about which
+        // products exist or what is wrong with its request.
+        RequireProvisioningToken(context);
+
+        var result = await operations.CreateInventoryItemAsync(
+            request.ProductId, request.InitialQuantity, context.CancellationToken);
+
+        return result.Outcome switch
+        {
+            CreateInventoryItemOutcome.Created => new CreateInventoryItemResponse
+            {
+                Status = CreateInventoryItemStatus.Created,
+                ProductId = request.ProductId
+            },
+
+            CreateInventoryItemOutcome.AlreadyCreated => new CreateInventoryItemResponse
+            {
+                Status = CreateInventoryItemStatus.AlreadyCreated,
+                ProductId = request.ProductId
+            },
+
+            CreateInventoryItemOutcome.Conflict =>
+                throw new RpcException(new Status(StatusCode.AlreadyExists,
+                    $"Product {request.ProductId} already has an inventory record that this request does not match.")),
+
+            CreateInventoryItemOutcome.InvalidArgument =>
+                throw new RpcException(new Status(StatusCode.InvalidArgument, result.ValidationError!)),
+
+            _ => throw UnexpectedOutcome(result.Outcome)
+        };
+    }
+
+    /// The shared secret is compared in constant time so response timing cannot be used to guess it.
+    private void RequireProvisioningToken(ServerCallContext context)
+    {
+        var expected = provisioning.Value.Token;
+
+        if (string.IsNullOrEmpty(expected))
+        {
+            logger.LogWarning("CreateInventoryItem refused: no Provisioning:Token is configured");
+            throw new RpcException(new Status(StatusCode.FailedPrecondition,
+                "Inventory provisioning is not enabled on this server."));
+        }
+
+        var supplied = context.RequestHeaders.GetValue(ProvisioningTokenHeader);
+
+        if (supplied is null ||
+            !CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(supplied), Encoding.UTF8.GetBytes(expected)))
+        {
+            logger.LogWarning("CreateInventoryItem refused: missing or invalid {Header}", ProvisioningTokenHeader);
+            throw new RpcException(new Status(StatusCode.Unauthenticated,
+                "A valid provisioning token is required."));
+        }
     }
 
     private RpcException UnexpectedOutcome<T>(T outcome) where T : struct, Enum

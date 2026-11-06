@@ -45,6 +45,25 @@ namespace InventoryService.Persistence.Migrations
                         });
                 });
 
+            modelBuilder.Entity("InventoryService.Domain.InventoryProvisioning", b =>
+                {
+                    b.Property<long>("ProductId")
+                        .HasColumnType("bigint");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("datetime2(3)");
+
+                    b.Property<int>("InitialQuantity")
+                        .HasColumnType("int");
+
+                    b.HasKey("ProductId");
+
+                    b.ToTable("InventoryProvisionings", null, t =>
+                        {
+                            t.HasCheckConstraint("CK_InventoryProvisionings_InitialQuantity_NonNegative", "[InitialQuantity] >= 0");
+                        });
+                });
+
             modelBuilder.Entity("InventoryService.Domain.Reservation", b =>
                 {
                     b.Property<string>("ReservationId")
@@ -92,6 +111,15 @@ namespace InventoryService.Persistence.Migrations
                         {
                             t.HasCheckConstraint("CK_ReservationItems_Quantity_Positive", "[Quantity] > 0");
                         });
+                });
+
+            modelBuilder.Entity("InventoryService.Domain.InventoryProvisioning", b =>
+                {
+                    b.HasOne("InventoryService.Domain.InventoryItem", null)
+                        .WithOne()
+                        .HasForeignKey("InventoryService.Domain.InventoryProvisioning", "ProductId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
                 });
 
             modelBuilder.Entity("InventoryService.Domain.ReservationItem", b =>
